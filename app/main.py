@@ -1,10 +1,12 @@
-# main.py
-
+import hashlib
+import json
 import logging
 import os
+import pickle
 import re
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import frontmatter
 import torch
@@ -36,6 +38,8 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     MODEL_PATH: str = Field(..., env="MODEL_PATH")
     CLUSTERS: Dict[str, str] = {"sherlock": "sherlock/", "farmshare": "farmshare/", "oak": "oak/", "elm": "elm/"}
+    # NEW: Add a configurable cache directory
+    DOC_CACHE_DIR: str = "doc_cache/"
     CORS_ORIGINS: List[str] = ['http://localhost:5000', 'http://127.0.0.1:5000']
     class Config:
         env_file = ".env"
@@ -60,14 +64,95 @@ class QueryResponse(BaseModel):
 
 # --- 3. Core Application Logic (RAG Service) ---
 
-class RAGService:
-    def __init__(self, config: Settings):
-        self.settings = config
-        self.llm = None
-        self.retrievers: Dict[str, BM25Retriever] = {}
-        self.chain = None
+# NEW: A dedicated class to manage document caching
+class DocumentCacheManager:
+    """Handles caching of processed documents to avoid re-ingestion on every startup."""
+    def __init__(self, cache_dir: str):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Document cache manager initialized at: {self.cache_dir.resolve()}")
 
-    def _ingest_markdown_files(self, corpus_dir: str) -> List[Document]:
+    def _get_cache_paths(self, cluster_name: str) -> Tuple[Path, Path]:
+        """Returns the paths for the pickled documents and their state file."""
+        state_filename = f"{cluster_name}_state.json"
+        docs_filename = f"{cluster_name}_docs.pkl"
+        return self.cache_dir / state_filename, self.cache_dir / docs_filename
+
+    def _get_current_file_states(self, corpus_dir: str) -> Dict[str, float]:
+        """Gets the current modification times for all .md files in a directory."""
+        states = {}
+        for filename in os.listdir(corpus_dir):
+            if filename.endswith(".md"):
+                file_path = os.path.join(corpus_dir, filename)
+                states[filename] = os.path.getmtime(file_path)
+        return states
+
+    def _is_cache_stale(self, cluster_name: str, corpus_dir: str) -> bool:
+        """Checks if the cached documents for a cluster are stale."""
+        state_path, docs_path = self._get_cache_paths(cluster_name)
+
+        if not state_path.exists() or not docs_path.exists():
+            logger.info(f"Cache miss for '{cluster_name}': No cache files found.")
+            return True
+
+        with open(state_path, 'r') as f:
+            try:
+                cached_states = json.load(f)
+            except json.JSONDecodeError:
+                logger.warning(f"Cache miss for '{cluster_name}': Could not decode state file.")
+                return True
+
+        current_states = self._get_current_file_states(corpus_dir)
+        
+        # If the set of filenames or any modification time has changed, cache is stale
+        if cached_states != current_states:
+            logger.info(f"Cache stale for '{cluster_name}': File states have changed.")
+            return True
+        
+        logger.info(f"Cache hit for '{cluster_name}': File states are unchanged.")
+        return False
+
+    def get_documents(self, cluster_name: str, corpus_dir: str) -> List[Document]:
+        """
+        Main method to get documents for a cluster.
+        Loads from cache if available and fresh, otherwise re-ingests and updates cache.
+        """
+        if self._is_cache_stale(cluster_name, corpus_dir):
+            logger.info(f"Re-ingesting documents for cluster '{cluster_name}'...")
+            documents = self._ingest_and_cache(cluster_name, corpus_dir)
+        else:
+            logger.info(f"Loading documents from cache for cluster '{cluster_name}'...")
+            state_path, docs_path = self._get_cache_paths(cluster_name)
+            try:
+                with open(docs_path, 'rb') as f:
+                    documents = pickle.load(f)
+            except (pickle.UnpicklingError, FileNotFoundError, EOFError) as e:
+                logger.warning(f"Failed to load from cache for '{cluster_name}' due to '{e}'. Re-ingesting.")
+                documents = self._ingest_and_cache(cluster_name, corpus_dir)
+        return documents
+
+    def _ingest_and_cache(self, cluster_name: str, corpus_dir: str) -> List[Document]:
+        """Performs the actual file ingestion and then saves the results to the cache."""
+        state_path, docs_path = self._get_cache_paths(cluster_name)
+        
+        # 1. Ingest from source files
+        documents = self._ingest_markdown_files(corpus_dir)
+        
+        # 2. Get current state and save it
+        current_states = self._get_current_file_states(corpus_dir)
+        with open(state_path, 'w') as f:
+            json.dump(current_states, f, indent=2)
+            
+        # 3. Save the processed documents
+        with open(docs_path, 'wb') as f:
+            pickle.dump(documents, f)
+            
+        logger.info(f"Successfully ingested and cached {len(documents)} documents for '{cluster_name}'.")
+        return documents
+
+    @staticmethod
+    def _ingest_markdown_files(corpus_dir: str) -> List[Document]:
+        """Static method to read and parse markdown files into Document objects."""
         documents = []
         for filename in os.listdir(corpus_dir):
             if filename.endswith(".md"):
@@ -78,10 +163,20 @@ class RAGService:
                     metadata['source'] = filename
                     doc = Document(page_content=post.content, metadata=metadata)
                     documents.append(doc)
-                    logger.info(f"ok loading from {file_path}")
                 except Exception as e:
                     logger.warning(f"Could not read or parse front matter from file {file_path}: {e}")
         return documents
+
+class RAGService:
+    def __init__(self, config: Settings):
+        self.settings = config
+        # NEW: Instantiate the cache manager
+        self.doc_cache_manager = DocumentCacheManager(config.DOC_CACHE_DIR)
+        self.llm = None
+        self.retrievers: Dict[str, BM25Retriever] = {}
+        self.chain = None
+
+    # REMOVED: _ingest_markdown_files is now a static method within DocumentCacheManager
 
     def initialize(self):
         logger.info("Initializing RAG Service...")
@@ -114,30 +209,52 @@ class RAGService:
                 logger.warning(f"Directory not found for cluster '{cluster_name}': {path}. Skipping.")
                 continue
             
-            logger.info(f"Ingesting documents for cluster: {cluster_name}")
-            documents = self._ingest_markdown_files(path)
+            # REFACTORED: Use the cache manager to get documents
+            documents = self.doc_cache_manager.get_documents(cluster_name, path)
+            
             if not documents:
-                logger.warning(f"No documents found for cluster '{cluster_name}'.")
+                logger.warning(f"No documents found or loaded for cluster '{cluster_name}'.")
                 continue
 
             split_docs = text_splitter.split_documents(documents)
             self.retrievers[cluster_name] = BM25Retriever.from_documents(split_docs)
             logger.info(f"Created retriever for '{cluster_name}'.")
 
-            prompt_template = ChatPromptTemplate.from_template(
-            """<s>[INST] You are an expert assistant for the Stanford Research Computing Center (SRCC).
-Your task is to answer the user's query based ONLY on the provided documentation context.
-- Your answer must be grounded in the facts from the CONTEXT below.
-- If the context does not contain the answer, state that you could not find the information.
-- Do not reference any specific documents by their filenames. If you must refer to a file, look up the title in the file's metadata.
-- Answer ONLY the user's query. Do not add any extra information, questions, or conversational text after the answer is complete.
+        # The RAG chain definition is only needed once, after all retrievers are built.
+        # Moved outside the loop for clarity and correctness.
+        if not self.retrievers:
+            logger.critical("FATAL: No retrievers were created. The application cannot answer queries.")
+            # Depending on desired behavior, you might want to raise an exception here.
+            return
+
+        prompt_template = ChatPromptTemplate.from_template(
+            """<s>[INST] You are a helpful and concise expert assistant for the Stanford Research Computing Center (SRCC).
+Your task is to answer the user's query using ONLY the information provided in the CONTEXT below.
+
+- If the CONTEXT does not contain the answer, state that the information is not available in the documentation.
+- Be direct. Do not add conversational filler, introductions, or conclusions.
 
 CONTEXT:
 {context}
 
 USER QUERY:
 {query} [/INST]"""
-        )
+    )
+        prompt_template = ChatPromptTemplate.from_template(
+    """<s>[INST] You are a friendly and knowledgeable expert for the Stanford Research Computing Center (SRCC).
+Your goal is to provide a helpful answer to the user's query based *only* on the provided documentation context.
+
+- Synthesize the information from the `CONTEXT` into a clear and direct answer.
+- If the `CONTEXT` does not contain a direct answer, state that, but also provide any closely related information from the `CONTEXT` that might be helpful.
+- If the `CONTEXT` is completely irrelevant, simply state that you cannot answer the query based on the provided documents.
+- Keep your answer focused on the query. Do not ask follow-up questions.
+
+CONTEXT:
+{context}
+
+USER QUERY:
+{query} [/INST]"""
+)
 
         def retrieve_and_format_context(inputs: Dict) -> str:
             query, cluster = inputs['query'], inputs['cluster']
@@ -187,35 +304,29 @@ USER QUERY:
 
         chain_input = {"query": request.query, "cluster": cluster, "retrieved_docs": []}
         try:
-            llm_answer_with_placeholders = self.chain.invoke(chain_input)
-            logger.info(f"llm_answer_with_placeholders: {llm_answer_with_placeholders}")
+            llm_answer = self.chain.invoke(chain_input)
             retrieved_docs = chain_input['retrieved_docs']
-            logger.info(f"retrieved_docs: {retrieved_docs}")
         except Exception as e:
             logger.error(f"Error during RAG chain invocation: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail="Failed to generate a response from the model.")
 
-        # 1. Extract cited filenames and build the list of Source objects
-        cited_filenames = set(re.findall(r'\[\s*([^\]]+)\]', llm_answer_with_placeholders))
-        metadata_lookup: Dict[str, Dict] = {
-            doc.metadata['source']: doc.metadata
-            for doc in retrieved_docs if 'source' in doc.metadata
-        } 
-
+        # Simplified source extraction logic. Assumes all retrieved docs are sources.
+        # This is more robust than parsing the LLM output.
         source_objects = []
-        for filename in sorted(list(cited_filenames)):
-            if filename in metadata_lookup:
-                metadata = metadata_lookup[filename]
-                title = metadata.get('title', filename)
-                url = metadata.get('url')
-                source_objects.append(Source(title=title, url=url))
+        if retrieved_docs:
+            seen_titles = set()
+            for doc in retrieved_docs:
+                metadata = doc.metadata
+                title = metadata.get('title', metadata.get('source', 'Unknown Source'))
+                if title not in seen_titles:
+                    source_objects.append(Source(
+                        title=title,
+                        url=metadata.get('url')
+                    ))
+                    seen_titles.add(title)
         
-        # 2. Clean the LLM's answer by removing all internal citation placeholders.
-        final_answer = re.sub(r'\s*\[source:\s*[^\]]+\]', '', llm_answer_with_placeholders).strip()
-
-        # 3. Return the clean answer and the separate source list.
         return QueryResponse(
-            answer=final_answer,
+            answer=llm_answer.strip(),
             cluster=cluster,
             sources=source_objects
         )

@@ -14,37 +14,24 @@ from urllib.parse import urljoin, urlparse
 from pprint import pprint
 from typing import Iterator, Dict, Any, Optional
 
-# Assuming var_clean_up.py exists and has the process_markdown_file function
-# from var_clean_up import process_markdown_file
-
-# --- MOCK function for demonstration if var_clean_up is not available ---
-def process_markdown_file(file_path):
-    """Placeholder function. Replace with your actual implementation."""
-    logging.info(f"Variable cleanup would run on: {file_path}")
-    # Example: return text.replace("{{ some_var }}", "some_value")
-    # For this rework, we'll just log and do nothing to the file.
-    return 
-# --- END MOCK ---
 
 # --- CONFIGURATION ---
-# Define all sources to be processed in this list.
-# To add a new repository, simply add a new dictionary to the SOURCES list.
 SOURCES = [
     {
         "repo_url": "git@github.com:stanford-rc/farmshare-docs.git",
-        "repo_name": "farmshare",  # A short name for creating directories
+        "repo_name": "farmshare",
     },
     {
         "repo_url": "git@github.com:stanford-rc/docs.elm.stanford.edu.git",
-        "repo_name": "elm",  # A short name for creating directories
+        "repo_name": "elm",
     },
      {
         "repo_url": "git@github.com:stanford-rc/docs.oak.stanford.edu.git",
-        "repo_name": "oak",  # A short name for creating directories
-    },   
+        "repo_name": "oak",
+    },
     {
         "repo_url": "git@github.com:stanford-rc/www.sherlock.stanford.edu.git",
-        "repo_name": "sherlock",  # A short name for creating directories
+        "repo_name": "sherlock",
         "scraper_targets": [
             {
                 "url": "https://www.sherlock.stanford.edu/docs/tech/facts/",
@@ -54,7 +41,7 @@ SOURCES = [
             {
                 "url": "https://www.sherlock.stanford.edu/docs/tech/",
                 "file": "sherlock/tech.md",
-                "title": "Sherlock Facts"
+                "title": "Sherlock Technical Documentation"
             },
             {
                 "url": "https://www.sherlock.stanford.edu/docs/software/list/",
@@ -73,38 +60,134 @@ SOURCES = [
             },
         ]
     },
-    # {
-    #     "repo_url": "https://github.com/another/example-repo.git",
-    #     "repo_name": "example",
-    #     "scraper_targets": [
-    #          { "url": "...", "file": "...", "title": "..." }
-    #     ]
-    # }
 ]
-
 # Configure logging
 LOG_FILE = 'magicFile.log'
 logging.basicConfig(level=logging.INFO,
                     filename=LOG_FILE,
-                    filemode='w',  # Start with a fresh log file each run
+                    filemode='w',
                     format='%(asctime)s - %(levelname)s - %(message)s')
-# --- END CONFIGURATION ---
-
 # --- General-Purpose Tolerant YAML Loader ---
 def ignore_and_warn_on_unknown_tags(loader, tag_prefix, node):
-    """A generic YAML constructor that gets called for any unrecognized tag."""
     logging.warning(f"Ignoring unknown YAML tag '{node.tag}'")
     return None
-
 class TolerantSafeLoader(yaml.SafeLoader):
-    """A custom SafeLoader that is tolerant of unknown tags."""
     pass
-
 TolerantSafeLoader.add_multi_constructor('!', ignore_and_warn_on_unknown_tags)
 TolerantSafeLoader.add_multi_constructor('tag:yaml.org,2002:python', ignore_and_warn_on_unknown_tags)
-# --- End of Custom Loader Definition ---
 
 
+# --- CORE FUNCTIONS ---
+
+# --- NEW FUNCTION ---
+def resolve_markdown_references(content: str) -> str:
+    """
+    Resolves Markdown reference-style links.
+    e.g., turns `[text][ref]` into `[text](url)` and removes the `[ref]: url` definitions.
+    """
+    # 1. Find all reference definitions, e.g., `[ref_name]: http://...`
+    # This pattern also handles optional titles like `[ref]: url "title"`
+    definition_pattern = re.compile(r"^\s*\[([^\]]+)\]:\s*([^\s]+)(?:\s+[\"'(].*[\"')])?\s*$", re.MULTILINE)
+    definitions = {ref.lower(): url for ref, url in definition_pattern.findall(content)}
+    
+    if not definitions:
+        return content # No references to resolve
+
+    logging.info(f"    - Found {len(definitions)} reference-style link definitions.")
+
+    # 2. Replace all reference usages, e.g., `[My Link][ref_name]`
+    usage_pattern = re.compile(r'(\[([^\]]+)\])\[([^\]]+)\]')
+
+    def replacer(match):
+        full_match, text_part, text_content, ref_name = match.groups(), match.group(1), match.group(2), match.group(3)
+        
+        # Handle implicit refs like `[ref_name]` where text is the ref
+        if not ref_name:
+             ref_name = text_content
+        
+        url = definitions.get(ref_name.lower().strip())
+        if url:
+            logging.info(f"    - Resolving ref '{ref_name}' to inline link.")
+            return f"[{text_content}]({url})"
+        else:
+            # If a reference is not found, leave it as is to avoid breaking content
+            return match.group(0)
+
+    # 3. Handle shorthand links where the text is the reference, e.g. [myref]
+    shorthand_pattern = re.compile(r'\[([^\]]+)\](?!\[|:|\()') # Negative lookaheads to avoid matching other link types
+
+    def shorthand_replacer(match):
+        ref_name = match.group(1)
+        url = definitions.get(ref_name.lower().strip())
+        if url:
+            logging.info(f"    - Resolving shorthand ref '{ref_name}' to inline link.")
+            return f"[{ref_name}]({url})"
+        return match.group(0) # Not a valid shorthand ref, leave it
+
+    # Apply replacements
+    content = usage_pattern.sub(replacer, content)
+    content = shorthand_pattern.sub(shorthand_replacer, content)
+
+    # 4. Remove the original definition lines from the content
+    content = definition_pattern.sub('', content).strip()
+    
+    return content
+
+
+def expand_markdown_links(content: str, base_url: str) -> str:
+    """Finds all relative Markdown links and expands them to absolute URLs."""
+    link_pattern = re.compile(r'\[([^\]]+)\]\((?!(#|mailto:|tel:))([^\)]+)\)')
+    def replacer(match):
+        text, _, url = match.groups()
+        parsed_url = urlparse(url.strip())
+        if not parsed_url.scheme and not parsed_url.netloc:
+            absolute_url = urljoin(base_url, url)
+            logging.info(f"    - Expanded MD link: '{url}' -> '{absolute_url}'")
+            return f'[{text}]({absolute_url})'
+        return match.group(0)
+    return link_pattern.sub(replacer, content)
+
+# --- REFACTORED FUNCTION ---
+def process_and_write_markdown_file(source_path: Path, dest_path: Path, meta: dict):
+    """
+    Reads a source Markdown file, resolves references, expands relative links,
+    adds YAML front matter, and writes the result.
+    """
+    try:
+        content = source_path.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        logging.warning(f"Source file not found: {source_path}. Skipping processing.")
+        return
+
+    front_matter_pattern = re.compile(r'^---\s*\n(.*?\n)---\s*\n', re.DOTALL)
+    match = front_matter_pattern.match(content)
+
+    existing_metadata, main_content = {}, content
+    if match:
+        try:
+            existing_metadata = yaml.load(match.group(1), Loader=TolerantSafeLoader) or {}
+        except yaml.YAMLError as e:
+            logging.warning(f"Could not parse existing front matter in {source_path}: {e}")
+        main_content = content[match.end():]
+
+    # --- NEW: Resolve reference-style links FIRST ---
+    main_content = resolve_markdown_references(main_content)
+
+    # --- THEN, expand any relative links (including those from the resolved refs) ---
+    page_base_url = meta.get('url')
+    if page_base_url:
+        main_content = expand_markdown_links(main_content, page_base_url)
+    else:
+        logging.warning(f"No 'url' in metadata for {source_path}, cannot expand relative links.")
+
+    existing_metadata.update(meta)
+    new_yaml_front_matter = yaml.dump(existing_metadata, default_flow_style=False, sort_keys=False)
+    new_content = f"---\n{new_yaml_front_matter}---\n\n{main_content.lstrip()}"
+    dest_path.write_text(new_content, encoding='utf-8')
+
+
+# --- Other functions (clone_repo, parse_nav_generator, scrape_url_to_file, etc.) ---
+# --- are unchanged and omitted for brevity. You can copy them from the previous version. ---
 def clone_repo(repo_url: str, local_path: Path):
     """Clones a GitHub repository, ensuring a fresh start."""
     logging.info(f"Cloning repository: {repo_url} into {local_path}")
@@ -145,55 +228,53 @@ def parse_nav_generator(node: Any, docs_dir: Path, current_category: Optional[st
                 yield from parse_nav_generator(path_or_list, docs_dir, current_category=title)
             elif isinstance(path_or_list, str):
                 yield {
-                    "title": title,
-                    "relative_path": path_or_list,
-                    "source_path": docs_dir / path_or_list,
-                    "file_name": Path(path_or_list).name
+                    "title": title, "relative_path": path_or_list,
+                    "source_path": docs_dir / path_or_list, "file_name": Path(path_or_list).name
                 }
-    elif isinstance(node, str):
-        if current_category:
-            yield {
-                "title": current_category,
-                "relative_path": node,
-                "source_path": docs_dir / node,
-                "file_name": Path(node).name
-            }
+    elif isinstance(node, str) and current_category:
+        yield {
+            "title": current_category, "relative_path": node,
+            "source_path": docs_dir / node, "file_name": Path(node).name
+        }
 
 def scrape_url_to_file(url: str, output_path: Path, title: str):
-    """Scrapes content from a URL, converts to Markdown, and saves to a file."""
+    """Scrapes HTML, expands relative links, converts to Markdown, and saves."""
     logging.info(f"-> Processing URL: {url}")
     try:
         response = requests.get(url, timeout=15)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
-        
         main_content_div = soup.find('div', role='main') or soup.find('article') or soup.find('section', id='info')
-
         if not main_content_div:
             logging.error(f"Could not find a suitable main content container on {url}")
             return
 
+        for a_tag in main_content_div.find_all('a', href=True):
+            href = a_tag.get('href')
+            parsed_href = urlparse(href)
+            if not parsed_href.scheme and not parsed_href.netloc:
+                absolute_url = urljoin(url, href)
+                a_tag['href'] = absolute_url
+                logging.info(f"    - Expanded HTML link: '{href}' -> '{absolute_url}'")
+
         markdown_content = md(str(main_content_div), heading_style="ATX")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(markdown_content, encoding='utf-8')
-        
         metadata_to_add = {'title': title, 'url': url}
-        add_metadata_to_file(output_path, output_path, metadata_to_add)
+        process_and_write_markdown_file(output_path, output_path, metadata_to_add)
         logging.info(f"✅ Success for: {output_path}")
 
     except requests.exceptions.RequestException as e:
         logging.error(f"❌ ERROR fetching {url}: {e}")
-    except IOError as e:
-        logging.error(f"❌ ERROR writing to {output_path}: {e}")
     except Exception as e:
-        logging.error(f"❌ An unexpected ERROR occurred for {url}: {e}")
+        logging.error(f"❌ An unexpected ERROR occurred for {url}: {e}", exc_info=True)
+
 
 def handle_duplicate_filename(filename: str, used_filenames: set) -> str:
     """Checks for and resolves duplicate filenames by appending a counter."""
     if filename not in used_filenames:
         used_filenames.add(filename)
         return filename
-    
     p = Path(filename)
     base, ext = p.stem, p.suffix
     counter = 1
@@ -204,38 +285,12 @@ def handle_duplicate_filename(filename: str, used_filenames: set) -> str:
             return new_filename
         counter += 1
 
-def add_metadata_to_file(source_path: Path, dest_path: Path, meta: dict):
-    """Reads a source file, adds YAML front matter, and writes to destination."""
-    try:
-        content = source_path.read_text(encoding='utf-8')
-    except FileNotFoundError:
-        logging.warning(f"Source file not found: {source_path}. Skipping metadata addition.")
-        return
-
-    front_matter_pattern = re.compile(r'^---\s*\n(.*?\n)---\s*\n', re.DOTALL)
-    match = front_matter_pattern.match(content)
-    
-    existing_metadata = {}
-    main_content = content
-    if match:
-        try:
-            existing_metadata = yaml.load(match.group(1), Loader=TolerantSafeLoader) or {}
-        except yaml.YAMLError as e:
-            logging.warning(f"Could not parse existing front matter in {source_path}: {e}")
-        main_content = content[match.end():]
-    
-    existing_metadata.update(meta)
-    new_yaml_front_matter = yaml.dump(existing_metadata, default_flow_style=False, sort_keys=False)
-    new_content = f"---\n{new_yaml_front_matter}---\n\n{main_content.lstrip()}"
-    dest_path.write_text(new_content, encoding='utf-8')
-
 def variable_clean_up(dest_path: Path):
     """Wrapper for the variable cleanup process."""
     try:
         process_markdown_file(dest_path)
     except Exception as e:
         logging.error(f"Failed to run variable cleanup on {dest_path}: {e}")
-
 
 def cleanup_directory(dir_path: Path):
     """Removes a directory if it exists."""
@@ -244,20 +299,14 @@ def cleanup_directory(dir_path: Path):
         shutil.rmtree(dir_path)
 
 def process_repository(config: dict):
-    """
-    Main processing logic for a single repository.
-    Clones, parses mkdocs.yml, processes files, and runs the scraper.
-    """
-    repo_url = config["repo_url"]
-    repo_name = config["repo_name"]
+    """Main processing logic for a single repository."""
+    repo_url, repo_name = config["repo_url"], config["repo_name"]
     scraper_targets = config.get("scraper_targets", [])
-
     print(f"\n{'='*20} Processing Repository: {repo_name} {'='*20}")
     logging.info(f"Starting processing for repository: {repo_url}")
 
-    # Define dynamic paths based on repo_name
     local_repo_path = Path(f"temp_repo_{repo_name}")
-    flat_output_dir = Path(f"{repo_name}")
+    flat_output_dir = Path(repo_name)
     output_csv_file = Path(f"{repo_name}_url_map.csv")
 
     try:
@@ -275,30 +324,25 @@ def process_repository(config: dict):
     else:
         process_mkdocs_repo(config_file, local_repo_path, flat_output_dir, output_csv_file)
 
-    # --- Scraper ---
-    if not scraper_targets:
-        print("No scraper targets defined for this repository.")
-    else:
+    if scraper_targets:
         print("\n--- Starting Scraper ---")
         for i, target in enumerate(scraper_targets, 1):
             print(f"\n[{i}/{len(scraper_targets)}] Scraping '{target.get('title')}'")
-            url = target.get("url")
-            file_path_str = target.get("file")
-            title = target.get("title")
-
+            url, file_path_str, title = target.get("url"), target.get("file"), target.get("title")
             if not all([url, file_path_str, title]):
                 logging.warning(f"Skipping invalid scraper target entry: {target}")
                 continue
-            
-            # Ensure the output file is inside the main output directory for this repo
             scrape_output_path = flat_output_dir / Path(file_path_str).name
             scrape_url_to_file(url=url, output_path=scrape_output_path, title=title)
+    else:
+        print("No scraper targets defined for this repository.")
 
     cleanup_directory(local_repo_path)
     print(f"--- Finished processing for {repo_name} ---")
 
+
 def process_mkdocs_repo(config_file: Path, repo_path: Path, flat_dir_path: Path, output_csv_file: Path):
-    """Handles the part of the processing specific to mkdocs repos."""
+    """Handles processing for mkdocs repos, including link expansion."""
     print(f"Loading configuration from: {config_file}")
     try:
         config = yaml.load(config_file.read_text(encoding='utf-8'), Loader=TolerantSafeLoader)
@@ -310,10 +354,9 @@ def process_mkdocs_repo(config_file: Path, repo_path: Path, flat_dir_path: Path,
     base_site_url = config.get('site_url')
     docs_dir_name = config.get('docs_dir', 'docs')
     nav = config.get('nav')
-
     if not all([base_site_url, nav]):
-        print("Error: 'site_url' and/or 'nav' not found in mkdocs.yml. Skipping doc generation.")
-        logging.error("'site_url' and/or 'nav' missing in mkdocs.yml.")
+        print("Error: 'site_url' or 'nav' not found in mkdocs.yml. Skipping doc generation.")
+        logging.error("'site_url' or 'nav' missing in mkdocs.yml.")
         return
 
     docs_dir = repo_path / docs_dir_name
@@ -333,29 +376,27 @@ def process_mkdocs_repo(config_file: Path, repo_path: Path, flat_dir_path: Path,
             doc_info['url'] = generate_url_from_path(doc_info['relative_path'], base_site_url)
             doc_info['file_name'] = handle_duplicate_filename(doc_info['file_name'], used_filenames)
             csv_writer.writerow({k: doc_info[k] for k in fieldnames})
-            
+
             destination_path = flat_dir_path / doc_info['file_name']
             print(f"  - Processing: {doc_info['relative_path']:<40} -> {destination_path}")
-            
+
             metadata_to_add = {'title': doc_info['title'], 'url': doc_info['url']}
-            add_metadata_to_file(doc_info['source_path'], destination_path, metadata_to_add)
+            process_and_write_markdown_file(doc_info['source_path'], destination_path, metadata_to_add)
             variable_clean_up(destination_path)
             processed_count += 1
-    
+
     print(f"\nSuccessfully processed {processed_count} documents from mkdocs.yml.")
     print(f"URL map written to {output_csv_file}")
     print(f"Markdown documents saved in {flat_dir_path}")
 
 def main():
-    """Main execution function to loop through all configured sources."""
+    """Main execution function."""
     print("--- Document Processing Script Started ---")
     logging.info("Script started.")
-    
     if not SOURCES:
         print("No sources configured in the 'SOURCES' list. Exiting.")
         logging.warning("SOURCES list is empty. Nothing to do.")
         return
-        
     for source_config in SOURCES:
         try:
             process_repository(source_config)
@@ -363,7 +404,6 @@ def main():
             repo_name = source_config.get("repo_name", "Unknown")
             print(f"An unexpected error occurred while processing {repo_name}. See log for details.")
             logging.error(f"CRITICAL FAILURE during processing of {repo_name}: {e}", exc_info=True)
-    
     print("\n--- All configured jobs have been processed. ---")
     logging.info("Script finished successfully.")
 
